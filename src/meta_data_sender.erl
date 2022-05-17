@@ -41,7 +41,7 @@
 
 -export([start_link/1,
     start/1,
-    put_meta/3,
+    put_meta/4,
     get_node_list/0,
     get_node_and_partition_list/0,
     get_merged_data/2,
@@ -105,9 +105,9 @@ get_name(Name) ->
     list_to_atom(atom_to_list(Name) ++ atom_to_list(?MODULE)).
 
 %% Insert meta data for some partition
--spec put_meta(atom(), partition_id(), term()) -> ok.
-put_meta(Name, Partition, NewData) ->
-    true = antidote_ets_meta_data:insert_meta_data(Name, Partition, NewData),
+-spec put_meta(atom(), dcid() | local, partition_id(), clock_time()) -> ok.
+put_meta(Name, Dcid, Partition, Time) ->
+    true = antidote_ets_meta_data:insert_meta_data(Name, Dcid, Partition, Time),
     ok.
 
 %% Remove meta data for partition
@@ -216,13 +216,24 @@ get_merged_meta_data(Name, CheckNodes) ->
             %% of nodes and partitions every time to see if any have been removed/added
             %% This is only done if the ring is expected to change, but should be done
             %% differently (check comment in get_node_and_partition_list())
-            {NewRemote, NewLocal} = case CheckNodes of
+            {NewRemote, NewLocal} =
+                case CheckNodes of
                     true ->
-                        {update(Name, Remote, NodeList, fun meta_data_manager:add_node/3, fun meta_data_manager:remove_node/2, undefined),
-                         update(Name, Local, PartitionList, fun put_meta/3, fun remove_partition/2, Name:default())};
+                        {update(Name,
+                                Remote,
+                                NodeList,
+                                fun meta_data_manager:add_node/3,
+                                fun meta_data_manager:remove_node/2,
+                                undefined),
+                         update(Name,
+                                Local,
+                                PartitionList,
+                                fun(N, P, T) -> put_meta(N, local, P, T) end,
+                                fun remove_partition/2,
+                                Name:default())};
                     false ->
                         {Remote, Local}
-                    end,
+                end,
             LocalMerged = Name:merge(NewLocal),
             {WillChange, maps:put(local_merged, LocalMerged, NewRemote)}
     end.

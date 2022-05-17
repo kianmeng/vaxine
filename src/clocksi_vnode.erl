@@ -242,6 +242,8 @@ handle_command({check_tables_ready}, _Sender, SD0 = #state{partition = Partition
 handle_command({send_min_prepared}, _Sender,
            State = #state{partition = Partition, prepared_dict = PreparedDict}) ->
     {ok, Time} = get_min_prep(PreparedDict),
+    meta_data_sender:put_meta(stable_time_functions,
+                              local, Partition, Time),
     dc_utilities:call_local_vnode(Partition, logging_vnode_master, {send_min_prepared, Time}),
     {noreply, State};
 
@@ -450,6 +452,11 @@ commit(Transaction, TxCommitTime, Updates, CommittedTx, State) ->
                     case update_materializer(Updates, Transaction, TxCommitTime) of
                         ok ->
                             NewPreparedDict = clean_and_notify(TxId, Updates, State),
+
+                            {ok, Time} = get_min_prep(NewPreparedDict),
+                            meta_data_sender:put_meta(stable_time_functions,
+                                                      local, State#state.partition, Time),
+
                             {ok, committed, NewPreparedDict};
                         error ->
                             {error, materializer_failure}
