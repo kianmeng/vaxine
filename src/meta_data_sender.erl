@@ -105,7 +105,7 @@ get_name(Name) ->
     list_to_atom(atom_to_list(Name) ++ atom_to_list(?MODULE)).
 
 %% Insert meta data for some partition
--spec put_meta(atom(), dcid() | local, partition_id(), clock_time()) -> ok.
+-spec put_meta(atom(), dcid() | local_dc, partition_id(), clock_time()) -> ok.
 put_meta(Name, Dcid, Partition, Time) ->
     true = antidote_ets_meta_data:insert_meta_data(Name, Dcid, Partition, Time),
     ok.
@@ -228,9 +228,9 @@ get_merged_meta_data(Name, CheckNodes) ->
                          update(Name,
                                 Local,
                                 PartitionList,
-                                fun(N, P, T) -> put_meta(N, local, P, T) end,
+                                fun (N, P, T) -> put_meta(N, local_dc, P, T) end,
                                 fun remove_partition/2,
-                                Name:default())};
+                                undefined)};
                     false ->
                         {Remote, Local}
                 end,
@@ -416,5 +416,10 @@ get_node_and_partition_list_t() ->
     [{nodes, Nodes}] = ets:lookup(node_table, nodes),
     [{partitions, Partitions}] = ets:lookup(node_table, partitions),
     {Nodes, Partitions, WillChange}.
+
+put_meta(MetaType, Partition, VectorClock) ->
+    [ put_meta(MetaType, Dc, Partition, Val)
+      || {Dc, Val} <- vectorclock:to_list(VectorClock)
+    ].
 
 -endif.

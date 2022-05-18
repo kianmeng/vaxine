@@ -74,7 +74,7 @@ create_remote_meta_data_table(Name) ->
 insert_meta_data_sender_merged_data(Name, Data) ->
     ets:insert(get_table_name(Name, ?META_DATA_SENDER_TABLE_NAME), {merged_data, Data}).
 
--spec insert_meta_data(atom(), dcid() | local, partition_id(), term()) -> true.
+-spec insert_meta_data(atom(), dcid() | local_dc, partition_id(), term()) -> true.
 insert_meta_data(Name, DcIdOrLocal, Partition, Data) ->
     ets:insert(get_table_name(Name, ?META_TABLE_NAME), {Partition, DcIdOrLocal, Data}).
 
@@ -104,9 +104,12 @@ remote_table_ready(Name) ->
 -spec get_meta_data_as_map(atom()) -> map().
 get_meta_data_as_map(Name) ->
       lists:foldl(
-        fun({Partition, DC, Val}, Acc) ->
+        fun({Partition, _DC, undefined}, Acc) ->
+                maps:update_with(Partition, fun(M) -> M end,
+                                #{}, Acc);
+           ({Partition, DC, Val}, Acc) ->
                 maps:update_with(Partition, fun(Map) -> maps:put(DC, Val, Map) end,
-                                 #{ DC=> Val }, Acc)
+                                 #{ DC => Val }, Acc)
         end, #{}, ets:tab2list(get_table_name(Name, ?META_TABLE_NAME))).
 
 -spec get_remote_meta_data_as_map(atom()) ->map().
