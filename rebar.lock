@@ -7,7 +7,7 @@
   {git,"https://github.com/zeromq/erlzmq2",
        {ref,"573d583930c4b1134e504bec83926d188112b401"}},
   0},
- {<<"poolboy">>,{pkg,<<"poolboy">>,<<"1.5.2">>},1},
+ {<<"poolboy">>,{pkg,<<"poolboy">>,<<"1.5.2">>},0},
  {<<"prometheus">>,{pkg,<<"prometheus">>,<<"4.8.2">>},0},
  {<<"prometheus_process_collector">>,
   {git,"https://github.com/deadtrickster/prometheus_process_collector.git",

@@ -1331,7 +1331,8 @@ insert_log_record(Log, LogId, LogRecord, EnableLogging) ->
             true ->
                 BinaryRecord = term_to_binary({LogId, LogRecord}),
                 ?STATS({log_append, Log, erlang:byte_size(BinaryRecord)}),
-                disk_log:blog(Log, term_to_binary({LogId, LogRecord}));
+                maybe_notify(LogId, LogRecord),
+                disk_log:blog(Log, BinaryRecord);
             false ->
                 ok
         end,
@@ -1341,6 +1342,20 @@ insert_log_record(Log, LogId, LogRecord, EnableLogging) ->
         {error, Reason} ->
             {error, Reason}
     end.
+
+maybe_notify(LogId, #log_record{log_operation = #log_operation{op_type = commit} = OP}
+             = LR) ->
+    TxId = OP#log_operation.tx_id,
+    CommitPayload = OP#log_operation.log_payload,
+    ok = logging_notification_server:notify_commit(
+           LogId, TxId,
+           CommitPayload#commit_log_payload.commit_time,
+           CommitPayload#commit_log_payload.snapshot_time
+          ),
+    ok;
+maybe_notify(_, _) ->
+    ok.
+
 
 %% @doc preflist_member: Returns true if the Partition identifier is
 %%              part of the Preflist

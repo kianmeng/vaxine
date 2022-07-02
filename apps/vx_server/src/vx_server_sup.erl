@@ -25,7 +25,8 @@ init([]) ->
     ChildSpecs =
         [ ?CHILD(vx_subs_server, worker, []),
           ?CHILD(vx_proxy_server, worker, []),
-          pb_sub_listener()
+          pb_sub_listener(),
+          wal_streamer()
         ],
     {ok, {SupFlags, ChildSpecs}}.
 
@@ -38,3 +39,12 @@ pb_sub_listener() ->
        },
       vx_subs_worker, []
      ).
+
+wal_streamer() ->
+    PoolName = vx_wal_streamer,
+    PoolArgs = [{name, {local, PoolName}},
+                {worker_module, PoolName},
+                {size, 20},
+                {max_overflow, 50}
+               ],
+    poolboy:child_spec(PoolName, PoolArgs, []).
