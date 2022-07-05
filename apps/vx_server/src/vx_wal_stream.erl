@@ -90,9 +90,9 @@ notify_commit({commit, Partition, TxId, CommitTime, SnapshotTime} = V, Pid) ->
             1 ->
                 Pid ! #commit{ partition = Partition, txid = TxId,
                                snapshot = SnapshotTime
-                             }
-        end,
-        ok
+                             },
+                ok
+        end
     catch T:E:_ ->
             logger:error("Notification failed ~p~n", [{T, E}]),
             ok
@@ -124,9 +124,14 @@ init(_Args) ->
     LogFile = proplists:get_value(file, InfoList),
     halt    = proplists:get_value(type, InfoList), %% Only handle halt type of the logs
 
-       {ok, init_stream, #data{file_name = LogFile,
+    Backoff0 = backoff:init(?POLL_RETRY_MIN, ?POLL_RETRY_MAX,
+                            self(), poll_retry),
+    Backoff1 = backoff:type(Backoff0, jitter),
+
+    {ok, init_stream, #data{file_name = LogFile,
                             txns_buffer = dict:new(),
-                            partition = Partition
+                            partition = Partition,
+                            poll_backoff = Backoff1
                            }}.
 
 %% Copied from logging_vnode and simplified for our case
@@ -141,18 +146,16 @@ init_stream({call, {Sender, _} = F}, {start_replication}, Data) ->
     %% FIXME: We support only single partition for now
     {ok, FD} = open_log(Data#data.file_name),
     MonRef = erlang:monitor(process, Sender),
-    Backoff0 = backoff:init(?POLL_RETRY_MIN, ?POLL_RETRY_MAX,
-                           self(), poll_retry),
-    Backoff1 = backoff:type(Backoff0, jitter),
 
     ok = logging_notification_server:add_handler(
            ?MODULE, notify_commit, [self()]),
     true = init_notification_slot(Data#data.partition),
+    {_, Backoff} = backoff:succeed(Data#data.poll_backoff),
 
     {next_state, stream_data, Data#data{client = Sender,
                                         mon_ref = MonRef,
                                         file_desc = FD,
-                                        poll_backoff = Backoff1
+                                        poll_backoff = Backoff
                                        },
      [{state_timeout, 0, wtf}, {reply, F, ok}]}.
 
