@@ -496,20 +496,10 @@ handle_command(
                 bucket_op_number = NewBucketOpId,
                 log_operation = LogOperation
             },
-            case insert_log_record(Log, LogId, LogRecord, EnableLog) of
+            case insert_log_record(Log, LogId, LogRecord, EnableLog, Sync) of
                 {ok, NewOpId} ->
                     inter_dc_log_sender_vnode:send(Partition, LogRecord),
-                    case Sync of
-                        true ->
-                            case disk_log:sync(Log) of
-                                ok ->
-                                    {reply, {ok, OpId}, State};
-                                {error, Reason} ->
-                                    {reply, {error, Reason}, State}
-                            end;
-                        false ->
-                            {reply, {ok, OpId}, State}
-                    end;
+                    {reply, {ok, OpId}, State};
                 {error, Reason} ->
                     {reply, {error, Reason}, State}
             end;
@@ -573,7 +563,7 @@ handle_command(
                                 true
                         end,
                         ExternalOpNum = LogRecord#log_record.op_number,
-                        case insert_log_record(Log, LogId, LogRecord, EnableLog) of
+                        case insert_log_record(Log, LogId, LogRecord, EnableLog, Sync) of
                             {ok, ExternalOpNum} ->
                                 %% Would need to uncomment this is local ops are sent to this function
                                 %% case IsLocal of
@@ -1134,7 +1124,7 @@ handle_handoff_data(
     case get_log_from_map(Map, Partition, LogId) of
         {ok, Log} ->
             %% Optimistic handling; crash otherwise.
-            {ok, _OpId} = insert_log_record(Log, LogId, LogRecord, EnableLog),
+            {ok, _OpId} = insert_log_record(Log, LogId, LogRecord, EnableLog, true),
             ok = disk_log:sync(Log),
             {reply, ok, State};
         {error, Reason} ->
@@ -1253,6 +1243,7 @@ open_logs(LogFile, [Next | Rest], Map, ClockTable, MaxVector) ->
     DataDir = data_dir(),
     LogPath = filename:join(DataDir, LogId),
     ?STATS({log_append, LogPath, filelib:file_size(LogPath ++ ".LOG")}),
+    io:format("DISK_LOG OPENED: ~p~n", [LogPath]),
     case disk_log:open([{name, LogPath}]) of
         {ok, Log} ->
             {eof, NewMaxVector} = get_last_op_from_log(Log, start, ClockTable, MaxVector),
@@ -1323,16 +1314,19 @@ fold_log(Log, Continuation, F, Acc) ->
 %%          Payload: The payload of the operation to insert
 %%      Return: {ok, OpId} | {error, Reason}
 %%
--spec insert_log_record(log(), log_id(), log_record(), boolean()) ->
+-spec insert_log_record(log(), log_id(), log_record(), boolean(), boolean()) ->
     {ok, op_number()} | {error, reason()}.
-insert_log_record(Log, LogId, LogRecord, EnableLogging) ->
+insert_log_record(Log, LogId, LogRecord, EnableLogging, Sync) ->
     Result =
         case EnableLogging of
             true ->
                 BinaryRecord = term_to_binary({LogId, LogRecord}),
                 ?STATS({log_append, Log, erlang:byte_size(BinaryRecord)}),
-                maybe_notify(LogId, LogRecord),
-                disk_log:blog(Log, BinaryRecord);
+
+                while([fun() -> disk_log:blog(Log, BinaryRecord) end,
+                       fun() -> maybe_sync(Log, LogId, Sync, LogRecord) end,
+                       fun() -> maybe_notify(LogId, LogRecord) end
+                      ]);
             false ->
                 ok
         end,
@@ -1343,7 +1337,13 @@ insert_log_record(Log, LogId, LogRecord, EnableLogging) ->
             {error, Reason}
     end.
 
-maybe_notify(LogId, #log_record{log_operation = #log_operation{op_type = commit} = OP}
+maybe_sync(Log, [LogId], true,
+           #log_record{log_operation = #log_operation{op_type = commit}}) ->
+    disk_log:sync(Log);
+maybe_sync(_, _, _, _) ->
+    ok.
+
+maybe_notify([LogId], #log_record{log_operation = #log_operation{op_type = commit} = OP}
              = LR) ->
     TxId = OP#log_operation.tx_id,
     CommitPayload = OP#log_operation.log_payload,
@@ -1353,9 +1353,18 @@ maybe_notify(LogId, #log_record{log_operation = #log_operation{op_type = commit}
            CommitPayload#commit_log_payload.snapshot_time
           ),
     ok;
-maybe_notify(_, _) ->
+maybe_notify([_], _) ->
     ok.
 
+while([H|T]) ->
+    case H() of
+        ok ->
+            while(T);
+        {error, Reason} ->
+            {error, Reason}
+    end;
+while([]) ->
+    ok.
 
 %% @doc preflist_member: Returns true if the Partition identifier is
 %%              part of the Preflist

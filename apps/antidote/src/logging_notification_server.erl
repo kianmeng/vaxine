@@ -5,7 +5,8 @@
 -behaviour(gen_event).
 
 -export([ start_link/0,
-          add_sup_handler/3,
+          add_handler/3,
+          remove_handler/2,
           notify_commit/4
         ]).
 -export([ init/1,
@@ -23,19 +24,21 @@ start_link() ->
 
 %% @doc Add subscribers handler. Handler should be as light-weight as possible,
 %% as it affects the flow of committed transactions.
--spec add_sup_handler(module(), atom(), term()) -> ok.
-add_sup_handler(M, F, HandlerState) ->
-    gen_event:add_sup_handler({local, ?MODULE}, ?MODULE,
+-spec add_handler(module(), atom(), term()) -> ok.
+add_handler(M, F, HandlerState) ->
+    gen_event:add_sup_handler(?MODULE, ?MODULE,
                              {M, F, HandlerState}).
 
+remove_handler(Handler, Args) ->
+    gen_event:delete_handler(?MODULE, Handler, Args).
+
 %% @doc Notify subscribers about new committed txn on the specific partition.
--spec notify_commit(antidote:partition_id(),
-                    antidote:txid(),
+-spec notify_commit(antidote:partition_id(), antidote:txid(),
                     {antidote:dcid(), antidote:clock_time()},
                     antidote:snapshot_time()) ->
           ok.
 notify_commit(Partition, TxId, CommitTime, SnapshotTime) ->
-    gen_event:sync_notify({local, ?MODULE},
+    gen_event:sync_notify(?MODULE,
                           {commit, Partition, TxId, CommitTime, SnapshotTime}).
 
 %%------------------------------------------------------------------------------
@@ -58,9 +61,17 @@ handle_event(Msg, State) ->
             remove_handler
     end.
 
+handle_info(Msg, State) ->
+    logger:warning("Unexpected info message: ~p~n", [Msg]),
+    {noreply, State}.
+
 terminate(_Arg, _State) ->
     ok.
 
-apply_handler({commit, Info}, State = #state{handler = {M, F, HandlerState0}}) ->
-    {ok, HandlerState1} = apply(M, F, [Info, HandlerState0]),
-    State#state{handler = {M, F, HandlerState1}}.
+apply_handler(Info, State = #state{handler = {M, F, HandlerState0}}) ->
+    case apply(M, F, [Info | HandlerState0]) of
+        ok ->
+            State;
+        {ok, HandlerState1} ->
+            State#state{handler = {M, F, HandlerState1}}
+    end.
