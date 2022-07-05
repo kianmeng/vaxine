@@ -1243,7 +1243,6 @@ open_logs(LogFile, [Next | Rest], Map, ClockTable, MaxVector) ->
     DataDir = data_dir(),
     LogPath = filename:join(DataDir, LogId),
     ?STATS({log_append, LogPath, filelib:file_size(LogPath ++ ".LOG")}),
-    io:format("DISK_LOG OPENED: ~p~n", [LogPath]),
     case disk_log:open([{name, LogPath}]) of
         {ok, Log} ->
             {eof, NewMaxVector} = get_last_op_from_log(Log, start, ClockTable, MaxVector),
@@ -1337,14 +1336,13 @@ insert_log_record(Log, LogId, LogRecord, EnableLogging, Sync) ->
             {error, Reason}
     end.
 
-maybe_sync(Log, [LogId], true,
+maybe_sync(Log, [_LogId], true,
            #log_record{log_operation = #log_operation{op_type = commit}}) ->
     disk_log:sync(Log);
 maybe_sync(_, _, _, _) ->
     ok.
 
-maybe_notify([LogId], #log_record{log_operation = #log_operation{op_type = commit} = OP}
-             = LR) ->
+maybe_notify([LogId], #log_record{log_operation = #log_operation{op_type = commit} = OP}) ->
     TxId = OP#log_operation.tx_id,
     CommitPayload = OP#log_operation.log_payload,
     ok = logging_notification_server:notify_commit(
@@ -1557,7 +1555,7 @@ append_log_record(
         bucket_op_number = NewOpId,
         log_operation = LogOperation
     },
-    {ok, _} = insert_log_record(Log, LogId, LogRecord, EnableLog),
+    {ok, _} = insert_log_record(Log, LogId, LogRecord, EnableLog, true),
     {Records, NewState} = append_log_record(LogId, Node, LocalLogId + 1, Entries - 1, State),
     {[{LogId, LogRecord}] ++ Records, NewState}.
 

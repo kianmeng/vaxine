@@ -90,8 +90,12 @@ endif
 
 systests: singledc multidc test_vx_ct
 
+ifdef SUITE
+SUITE_OPT=--suite ${SUITE}
+endif
+
 test_vx_ct:
-	${REBAR} ct --dir apps/vx_server/test --cover_export_name=vx_dc
+	${REBAR} ct --dir apps/vx_server/test --cover --cover_export_name=vx_dc ${SUITE_OPT}
 
 docs:
 	${REBAR} doc skip_deps=true

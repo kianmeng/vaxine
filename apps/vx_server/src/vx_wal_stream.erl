@@ -10,7 +10,6 @@
 
 -export([ init/1,
           init_stream/3,
-          stream_data/3,
           await_data/3,
           callback_mode/0,
           terminate/3,
@@ -56,6 +55,7 @@ start_link(Args) ->
     gen_statem:start_link(?MODULE, Args, []).
 
 %% @doc
+-spec start_replication(list()) -> {ok, pid()} | {error, term()}.
 start_replication(_DiskLogPos) ->
     case poolboy:checkout(?MODULE, false) of
         full ->
@@ -64,8 +64,10 @@ start_replication(_DiskLogPos) ->
             gen_statem:call(Pid, {start_replication}, infinity)
     end.
 
+-spec stop_replication(pid()) -> ok.
 stop_replication(Pid) ->
-    gen_statem:call(Pid, {stop_replication}, infinity).
+    catch gen_statem:call(Pid, {stop_replication}, infinity),
+    poolboy:checkin(?MODULE, Pid).
 
 %% @doc Callback for logging_vnode to notify us about new transactions
 -spec notify_commit(term(), pid()) -> ok.
@@ -147,32 +149,62 @@ init_stream({call, {Sender, _} = F}, {start_replication}, Data) ->
     {ok, FD} = open_log(Data#data.file_name),
     MonRef = erlang:monitor(process, Sender),
 
+    true = init_notification_slot(Data#data.partition),
     ok = logging_notification_server:add_handler(
            ?MODULE, notify_commit, [self()]),
-    true = init_notification_slot(Data#data.partition),
     {_, Backoff} = backoff:succeed(Data#data.poll_backoff),
 
-    {next_state, stream_data, Data#data{client = Sender,
-                                        mon_ref = MonRef,
-                                        file_desc = FD,
-                                        poll_backoff = Backoff
-                                       },
-     [{state_timeout, 0, wtf}, {reply, F, ok}]}.
+    {next_state, await_data, Data#data{client = Sender,
+                                       mon_ref = MonRef,
+                                       file_desc = FD,
+                                       poll_backoff = Backoff
+                                      },
+     [{state_timeout, 0, {timeout, undefined, poll_retry} },
+      {reply, F, {ok, self()}}]};
 
-stream_data(_, wtf, Data) ->
-   continue_streaming(Data);
-
-stream_data(_, state_timeout, Data) ->
-    continue_streaming(Data).
+init_stream(info, {gen_event_EXIT, _Handler, _Reason}, Data) ->
+    {keep_state, Data}.
 
 await_data(_, #commit{txid = TxId}, #data{poll_tref = undefined} = Data) ->
     continue_streaming(Data#data{last_notif_txid = TxId});
+
 await_data(_, #commit{}, Data) ->
     {keep_state, Data};
+
 await_data(_, {timeout, TRef, poll_retry}, Data = #data{poll_tref = TRef}) ->
     %% FIXME: set to debug
     logger:info("poll retry: ~p~n", [Data#data.poll_backoff]),
     continue_streaming(Data#data{poll_tref = undefined});
+
+await_data({call, Sender}, {stop_replication}, Data) ->
+    file:close(Data#data.file_desc),
+    ok = logging_notification_server:delete_handler([]),
+    erlang:demonitor(Data#data.mon_ref),
+    {_, Backoff} = backoff:succeed(Data#data.poll_backoff),
+    case Data#data.poll_tref of
+        undefined -> ok;
+        Tref ->
+            erlang:cancel_timer(Tref)
+    end,
+    {next_state, init_stream, #data{file_name = Data#data.file_name,
+                                    txns_buffer = dict:new(),
+                                    partition = Data#data.partition,
+                                    poll_backoff = Backoff
+                                   },
+     [{reply, Sender, ok}]
+    };
+
+await_data({call, Sender}, Msg, Data) ->
+    %% FIXME: handle {stop_replication} message here
+    logger:info("Ignored message: ~p~n", [Msg]),
+    {keep_state, Data, [{reply, Sender, {error, unhandled_msg}}] };
+
+await_data(info, {gen_event_EXIT, _Handler, _Reason}, Data) ->
+    %% FIXME: probably safer just to restart the process
+    ok = logging_notification_server:add_handler(
+           ?MODULE, notify_commit, [self()]),
+    {keep_state, Data};
+
 await_data(_, Msg, Data) ->
     %% FIXME: handle {stop_replication} message here
     logger:info("Ignored message: ~p~n", [Msg]),
@@ -183,7 +215,7 @@ await_data(_, Msg, Data) ->
 continue_streaming(#data{partition = Partition} = Data) ->
     logger:info("Continue wal streaming for client ~p on partition ~p"
                 " at position ~p~n",
-                 [Data#data.client, Data#data.partition, Data#data.file_pos]),
+                [Data#data.client, Data#data.partition, Data#data.file_pos]),
 
     case read_ops_from_log(Data) of
         {eof, N, Data1} ->
@@ -358,16 +390,15 @@ process_op(#log_operation{op_type = commit, tx_id = TxId, log_payload = Payload}
     end.
 
 prepare_txn_operations(TxId, ST, TxOpsList0) ->
+    %% FIXME: use debug instead
     logger:info("preprocess txn:~n ~p ~p ~p~n", [TxId, ST, TxOpsList0]),
 
-    %% FIXME: Do we do materialization here?
     TxOpsList1 =
         lists:map(fun(#update_log_payload{key = K, type = T}) ->
                           {K, T, materialize(K, T, ST, TxId)}
                   end, TxOpsList0),
 
     logger:info("processed txn:~n ~p ~p~n", [TxId, TxOpsList1]),
-
     {TxId, TxOpsList1}.
 
 prepare_txn_operations(TxId, aborted) ->

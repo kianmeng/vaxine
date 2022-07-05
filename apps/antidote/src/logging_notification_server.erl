@@ -6,7 +6,7 @@
 
 -export([ start_link/0,
           add_handler/3,
-          remove_handler/2,
+          delete_handler/1,
           notify_commit/4
         ]).
 -export([ init/1,
@@ -17,7 +17,6 @@
         ]).
 
 -record( state, { handler :: handler() } ).
--type state() :: #state{}.
 -type handler() :: {module(), atom(), term()}.
 
 start_link() ->
@@ -27,11 +26,10 @@ start_link() ->
 %% as it affects the flow of committed transactions.
 -spec add_handler(module(), atom(), term()) -> ok.
 add_handler(M, F, HandlerState) ->
-    gen_event:add_sup_handler(?MODULE, ?MODULE,
-                             {M, F, HandlerState}).
+    gen_event:add_sup_handler(?MODULE, {?MODULE, self()}, {M, F, HandlerState}).
 
-remove_handler(Handler, Args) ->
-    gen_event:delete_handler(?MODULE, Handler, Args).
+delete_handler(Args) ->
+    gen_event:delete_handler(?MODULE, {?MODULE, self()}, Args).
 
 %% @doc Notify subscribers about new committed txn on the specific partition.
 -spec notify_commit(antidote:partition_id(), antidote:txid(),
