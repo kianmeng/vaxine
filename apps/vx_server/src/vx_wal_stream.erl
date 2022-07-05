@@ -339,13 +339,15 @@ process_op(#log_operation{op_type = abort, tx_id = TxId}, RemainingOps, Finalize
     end;
 process_op(#log_operation{op_type = commit, tx_id = TxId, log_payload = Payload},
            RemainingOps, FinalizedTxns) ->
-    #commit_log_payload{commit_time = {_DcId, _TxCommitTime},
+    #commit_log_payload{commit_time = {DcId, TxCommitTime},
                         snapshot_time = ST
                        } = Payload,
+    TxST = vectorclock:set(DcId, TxCommitTime, ST),
+
     case dict:take(TxId, RemainingOps) of
         {TxOpsList, RemainingOps1} ->
             {RemainingOps1,
-             [prepare_txn_operations(TxId, ST, TxOpsList)
+             [prepare_txn_operations(TxId, TxST, TxOpsList)
              | FinalizedTxns]};
         error ->
             logger:warning("Empty transaction: ~p~n", [TxId]),
