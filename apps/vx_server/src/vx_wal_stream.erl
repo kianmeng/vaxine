@@ -28,6 +28,9 @@
 -include_lib("antidote/include/antidote.hrl").
 -include("vx_wal_stream.hrl").
 
+-define(POLL_RETRY_MIN, 10).
+-define(POLL_RETRY_MAX, timer:seconds(10)).
+
 -record(data, {client :: pid() | undefined,
                mon_ref:: reference() | undefined,
                file_desc :: file:fd() | undefined,
@@ -35,8 +38,12 @@
                file_buff = [] :: term(),
                file_pos = 0 :: non_neg_integer(),
                txns_buffer :: txns_noncomitted_map(),
-               %% Last processed TxId. May be either comitted or aborted
-               last_txid :: antidote:txid() | undefined,
+               %% Last read TxId. May be either comitted or aborted
+               last_read_txid :: antidote:txid() | undefined,
+               %% Last txid we have been notified about
+               last_notif_txid :: antidote:txid() | undefined,
+               poll_tref :: reference() | undefined,
+               poll_backoff :: backoff:backoff(),
                partition :: antidote:partition_id()
               }).
 
@@ -84,8 +91,9 @@ notify_commit({commit, Partition, TxId, CommitTime, SnapshotTime} = V, Pid) ->
                 Pid ! #commit{ partition = Partition, txid = TxId,
                                snapshot = SnapshotTime
                              }
-        end
-    catch T:E ->
+        end,
+        ok
+    catch T:E:_ ->
             logger:error("Notification failed ~p~n", [{T, E}]),
             ok
     end.
@@ -116,11 +124,7 @@ init(_Args) ->
     LogFile = proplists:get_value(file, InfoList),
     halt    = proplists:get_value(type, InfoList), %% Only handle halt type of the logs
 
-    ok = logging_notification_server:add_handler(
-           ?MODULE, notify_commit, [self()]),
-    true = init_notification_slot(Partition),
-
-    {ok, init_stream, #data{file_name = LogFile,
+       {ok, init_stream, #data{file_name = LogFile,
                             txns_buffer = dict:new(),
                             partition = Partition
                            }}.
@@ -137,10 +141,18 @@ init_stream({call, {Sender, _} = F}, {start_replication}, Data) ->
     %% FIXME: We support only single partition for now
     {ok, FD} = open_log(Data#data.file_name),
     MonRef = erlang:monitor(process, Sender),
+    Backoff0 = backoff:init(?POLL_RETRY_MIN, ?POLL_RETRY_MAX,
+                           self(), poll_retry),
+    Backoff1 = backoff:type(Backoff0, jitter),
+
+    ok = logging_notification_server:add_handler(
+           ?MODULE, notify_commit, [self()]),
+    true = init_notification_slot(Data#data.partition),
 
     {next_state, stream_data, Data#data{client = Sender,
                                         mon_ref = MonRef,
-                                        file_desc = FD
+                                        file_desc = FD,
+                                        poll_backoff = Backoff1
                                        },
      [{state_timeout, 0, wtf}, {reply, F, ok}]}.
 
@@ -150,30 +162,57 @@ stream_data(_, wtf, Data) ->
 stream_data(_, state_timeout, Data) ->
     continue_streaming(Data).
 
+await_data(_, #commit{txid = TxId}, #data{poll_tref = undefined} = Data) ->
+    continue_streaming(Data#data{last_notif_txid = TxId});
 await_data(_, #commit{}, Data) ->
-    continue_streaming(Data);
-await_data(_, _, Data) ->
+    {keep_state, Data};
+await_data(_, {timeout, TRef, poll_retry}, Data = #data{poll_tref = TRef}) ->
+    %% FIXME: set to debug
+    logger:info("poll retry: ~p~n", [Data#data.poll_backoff]),
+    continue_streaming(Data#data{poll_tref = undefined});
+await_data(_, Msg, Data) ->
+    %% FIXME: handle {stop_replication} message here
+    logger:info("Ignored message: ~p~n", [Msg]),
     {keep_state, Data}.
 
-continue_streaming(Data) ->
+%%------------------------------------------------------------------------------
+
+continue_streaming(#data{partition = Partition} = Data) ->
     logger:info("Continue wal streaming for client ~p on partition ~p"
                 " at position ~p~n",
                  [Data#data.client, Data#data.partition, Data#data.file_pos]),
 
     case read_ops_from_log(Data) of
-        {eof, Data1} ->
-            ok = mark_as_ready_for_notification(Data1#data.partition),
-            case fetch_latest_position(Data1#data.partition) of
+        {eof, N, Data1} ->
+            {_, Backoff} = case N of
+                          0 -> backoff:fail(Data#data.poll_backoff);
+                          N when N > 0 -> backoff:succeed(Data#data.poll_backoff)
+                      end,
+            Data2 = Data1#data{poll_backoff = Backoff},
+
+            ok = mark_as_ready_for_notification(Partition),
+            case fetch_latest_position(Partition) of
                 undefined ->
-                    {next_state, await_data, Data1};
-                {TxId, _, _} when TxId == Data1#data.last_txid ->
-                    {next_state, await_data, Data1};
-                {_TxId, _, _} ->
-                    continue_streaming(Data1)
+                    {next_state, await_data, Data2};
+                {TxId, _, _} when TxId == Data2#data.last_read_txid ->
+                    {next_state, await_data, Data2};
+                {TxId, _, _} when TxId == Data2#data.last_notif_txid ->
+                    %% No matter whether or not we read something new,
+                    %% we didn't read TxId transaction, so set the poll timer
+                    %% based on backoff value
+                    {next_state, await_data, set_poll_timer(Data2)};
+                {TxId, _, _} ->
+                    %% New TxId since we last checked. For now I would like
+                    %% to keep it as a separate case here.
+                    {next_state, await_data,
+                     set_poll_timer(Data2#data{last_notif_txid = TxId})}
             end;
         {error, _} = Error ->
             {stop, Error}
     end.
+
+set_poll_timer(Data) ->
+    Data#data{poll_tref = backoff:fire(Data#data.poll_backoff)}.
 
 -spec fetch_latest_position(antidote:partition_id()) -> undefined |
           {antidote:txid(), antidote:clock_time(), antidote:snapshot_time()}.
@@ -201,11 +240,14 @@ open_log(LogFile) ->
     {ok, _Head} = file:read(FD, _Header = 8),
     {ok, FD}.
 
+read_ops_from_log(Data) ->
+    read_ops_from_log(Data, 0).
+
 read_ops_from_log(#data{txns_buffer = TxnBuff,
                         file_pos = FPos,
                         file_buff = FBuff,
                         file_desc = Fd
-                       } = Data) ->
+                       } = Data, N) ->
     case read_ops_from_log(Fd, Data#data.file_name, FPos, FBuff, TxnBuff) of
         {eof, LogPosition, {NonComittedMap, ComittedData}} ->
             %% FIXME: What is the position here?
@@ -215,7 +257,7 @@ read_ops_from_log(#data{txns_buffer = TxnBuff,
                                                       file_pos = FPos1,
                                                       file_buff = FBuff1
                                                      }),
-            {eof, Data1};
+            {eof, N, Data1};
         {error, _} = Error ->
             Error;
         {ok, LogPosition, {NonComittedMap, ComittedData}} ->
@@ -225,7 +267,7 @@ read_ops_from_log(#data{txns_buffer = TxnBuff,
                                                       file_buff = FBuff1,
                                                       txns_buffer = NonComittedMap
                                                      }),
-            read_ops_from_log(Data1)
+            read_ops_from_log(Data1, N+1)
     end.
 
 -type txns_noncomitted_map() :: dict:dict(antidote:txid(), [any_log_payload()]).
@@ -333,7 +375,7 @@ notify_client([], Data) ->
     {ok, Data};
 notify_client(FinalyzedTxns, #data{client = ClientPid} = Data) ->
     {ok, LastTxId} = notify_client0(FinalyzedTxns, undefined, ClientPid),
-    {ok, Data#data{last_txid = LastTxId}}.
+    {ok, Data#data{last_read_txid = LastTxId}}.
 
 notify_client0([{TxId, TxOpsList} | FinalyzedTxns], _LastTxn, ClientPid)
  when is_list(TxOpsList)->

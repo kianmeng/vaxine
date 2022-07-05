@@ -87,7 +87,7 @@
     %%                stored to disk (this is very slow in the current logging setup)
     %%        false -> all updates are sent to the operating system to be stored to disk (eventually), but are not guaranteed to be stored durably on disk
     %%                 when the reply is sent
-    {sync_log, true}
+    {sync_log, false}
 
     %% %% enable_logging:
     %%        true -> writes to disk done by the logging_vnode are enabled
