@@ -360,7 +360,7 @@ simple_sub_test_() ->
 simple_new_client() ->
     erlang:process_flag(trap_exit, true),
 
-    {ok, Pid} = vx_subs_server:start_link(),
+    {ok, _Pid} = vx_subs_server:start_link(),
     SubPid = spawn_link(
                fun() ->
                        ok = vx_subs_server:add_new_client(none),

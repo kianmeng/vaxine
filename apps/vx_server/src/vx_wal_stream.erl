@@ -5,6 +5,7 @@
 -export([ start_link/1,
           start_replication/1,
           stop_replication/1,
+          ack_replication/1,
           notify_commit/2
         ]).
 
@@ -64,9 +65,14 @@ start_replication(_DiskLogPos) ->
             gen_statem:call(Pid, {start_replication}, infinity)
     end.
 
--spec stop_replication(pid()) -> ok.
+%% @doc Ask wal streamer for more data.
+-spec ack_replication(pid()) -> ok | {error, term()}.
+ack_replication(Pid) ->
+    gen_statem:call(Pid, {ack_replication}).
+
+-spec stop_replication(pid()) -> ok | {error, term()}.
 stop_replication(Pid) ->
-    catch gen_statem:call(Pid, {stop_replication}, infinity),
+    catch gen_statem:call(Pid, {stop_replication}),
     poolboy:checkin(?MODULE, Pid).
 
 %% @doc Callback for logging_vnode to notify us about new transactions
@@ -177,15 +183,15 @@ await_data(_, {timeout, TRef, poll_retry}, Data = #data{poll_tref = TRef}) ->
     continue_streaming(Data#data{poll_tref = undefined});
 
 await_data({call, Sender}, {stop_replication}, Data) ->
-    file:close(Data#data.file_desc),
+    _ = file:close(Data#data.file_desc),
     ok = logging_notification_server:delete_handler([]),
     erlang:demonitor(Data#data.mon_ref),
     {_, Backoff} = backoff:succeed(Data#data.poll_backoff),
-    case Data#data.poll_tref of
-        undefined -> ok;
-        Tref ->
-            erlang:cancel_timer(Tref)
-    end,
+    _ = case Data#data.poll_tref of
+            undefined -> ok;
+            Tref ->
+                erlang:cancel_timer(Tref)
+        end,
     {next_state, init_stream, #data{file_name = Data#data.file_name,
                                     txns_buffer = dict:new(),
                                     partition = Data#data.partition,
@@ -415,7 +421,7 @@ notify_client(FinalyzedTxns, #data{client = ClientPid} = Data) ->
 
 notify_client0([{TxId, TxOpsList} | FinalyzedTxns], _LastTxn, ClientPid)
  when is_list(TxOpsList)->
-    ClientPid ! {TxId, TxOpsList},
+    ClientPid ! #wal_txn{txid = TxId, ops = TxOpsList},
     notify_client0(FinalyzedTxns, TxId, ClientPid);
 notify_client0([{TxId, aborted} | FinalyzedTxns], _LastTxn, ClientPid) ->
     notify_client0(FinalyzedTxns, TxId, ClientPid);

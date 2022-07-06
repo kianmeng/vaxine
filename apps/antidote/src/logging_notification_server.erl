@@ -7,7 +7,8 @@
 -export([ start_link/0,
           add_handler/3,
           delete_handler/1,
-          notify_commit/4
+          notify_commit/4,
+          stop/0
         ]).
 -export([ init/1,
           handle_event/2,
@@ -21,6 +22,9 @@
 
 start_link() ->
     gen_event:start_link({local, ?MODULE}, []).
+
+stop() ->
+    gen_event:stop(?MODULE).
 
 %% @doc Add subscribers handler. Handler should be as light-weight as possible,
 %% as it affects the flow of committed transactions.

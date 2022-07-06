@@ -12,4 +12,14 @@
         }
        ).
 
+-record(wal_txn,
+        { txid :: antidote:txid(),
+          ops :: [ { antidote:key(),
+                     antidote:type(),
+                     antidote:snapshot()
+                   }
+                 ]
+        }
+       ).
+
 -endif.

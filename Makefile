@@ -61,8 +61,11 @@ stage :
 
 test: test-vaxine test-vax
 
+ifdef EUNIT_MODS
+EUNIT_MODULES=--module=${EUNIT_MODS}
+endif
 test-vaxine:
-	${REBAR} eunit --verbose
+	${REBAR} eunit --verbose ${EUNIT_MODULES}
 
 test-vax:
 	make test -C apps/vax

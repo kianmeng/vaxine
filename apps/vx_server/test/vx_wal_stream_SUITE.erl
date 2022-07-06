@@ -3,6 +3,7 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("vx_server/include/vx_wal_stream.hrl").
 
 -define(APP, vx_server).
 -define(comment(A), [{userdata,
@@ -66,7 +67,8 @@ single_txn(_Config) ->
     ct:log("message: ~p~n", [Msg]),
 
     K = key_format(Key, Bucket),
-    ?assertMatch({_Txn, [{K, Type, Value}]}, Msg),
+    ?assertMatch(#wal_txn{txid = _Txn,
+                          ops = [{K, Type, Value}]}, Msg),
 
     ok = vx_wal_stream:stop_replication(Pid).
 
@@ -80,7 +82,8 @@ single_txn_from_history(_Config) ->
     ct:log("message: ~p~n", [Msg]),
 
     K = key_format(Key, Bucket),
-    ?assertMatch({_Txn, [{K, Type, Value}]}, Msg),
+    ?assertMatch(#wal_txn{txid = _Txn,
+                          ops = [{K, Type, Value}]}, Msg),
 
     assert_receive(100),
 
@@ -96,7 +99,8 @@ single_txn_from_history2(_Config) ->
     ct:log("message: ~p~n", [Msg]),
 
     K = key_format(Key, Bucket),
-    ?assertMatch({_Txn, [{K, Type, Value}]}, Msg),
+    ?assertMatch(#wal_txn{txid = _Txn,
+                          ops = [{K, Type, Value}]}, Msg),
 
     assert_receive(100),
 
@@ -104,7 +108,8 @@ single_txn_from_history2(_Config) ->
     [Msg1] = assert_count(1, 1000),
     ct:log("message: ~p~n", [Msg1]),
 
-    ?assertMatch({_Txn, [{K, Type, 11}]}, Msg1),
+    ?assertMatch(#wal_txn{txid = _Txn,
+                          ops = [{K, Type, 11}]}, Msg1),
 
     assert_receive(100),
 

@@ -62,9 +62,9 @@ handle_info({'DOWN', MonRef, process, Pid, Reason}, State) ->
         _ ->
             Partitions = dc_utilities:get_all_partitions(),
             _ = [
-                 logging_notification_server:remove_handler(
-                   {vx_wal_stream, {Partition, Pid}}, []) ||
-                    Partition <- Partitions
+                 logging_notification_server:delete_handler(
+                   {Partition, Pid})
+                 || Partition <- Partitions
                 ],
             {noreply, State1}
     end;

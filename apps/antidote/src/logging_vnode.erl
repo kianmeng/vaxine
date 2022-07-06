@@ -1555,7 +1555,7 @@ append_log_record(
         bucket_op_number = NewOpId,
         log_operation = LogOperation
     },
-    {ok, _} = insert_log_record(Log, LogId, LogRecord, EnableLog, true),
+    {ok, _} = insert_log_record(Log, LogId, LogRecord, EnableLog, false),
     {Records, NewState} = append_log_record(LogId, Node, LocalLogId + 1, Entries - 1, State),
     {[{LogId, LogRecord}] ++ Records, NewState}.
 
@@ -1626,10 +1626,12 @@ read_from_to_internal3_test() ->
 % runs a test with setup and cleanup for the test
 test_with_log(N, F) ->
     State = init_log(0, N),
+    logging_notification_server:start_link(),
     try
         F(State)
     after
-        log_cleanup(State)
+        log_cleanup(State),
+        logging_notification_server:stop()
     end.
 
 -endif.
