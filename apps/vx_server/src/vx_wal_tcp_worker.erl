@@ -2,7 +2,9 @@
 -behaviour(ranch_protocol).
 -behaviour(gen_server).
 
--export([ start_link/3 ]).
+-export([ start_link/3,
+          send/2
+        ]).
 -export([ init/1,
           handle_call/3,
           handle_cast/2,
@@ -19,6 +21,15 @@
 start_link(Ref, Transport, ProtoOpts) ->
     Pid = proc_lib:spawn_link(?MODULE, init, [{Ref, Transport, ProtoOpts}]),
     {ok, Pid}.
+
+send(Port, Data) ->
+    Binary = term_to_binary(Data),
+    try
+        erlang:port_command(Port, Binary, [nosuspend])
+    catch _:_ ->
+            {error, port_closed}
+    end.
+
 
 init({Ref, Transport, _Opts}) ->
     {ok, Socket} = ranch:handshake(Ref),
