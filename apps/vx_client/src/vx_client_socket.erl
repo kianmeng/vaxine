@@ -122,6 +122,10 @@ handle_cast({get_next_bulk, N}, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info({tcp, Socket, Data}, State) ->
+    logger:debug("tcp_data: ~p~n", [binary_to_term(Data)]),
+    ok = inet:setopts(Socket, [{active, once}]),
+    {noreply, State};
 handle_info({tcp_error, _, Reason}, State) ->
     maybe_reconnect(Reason, State);
 handle_info({tcp_closed, _}, State) ->
@@ -187,7 +191,7 @@ maybe_reconnect(Error, State = #state{reconnect_backoff = Backoff0, opts = Optio
                                                      socket_status = disconnected
                                                     })};
         false ->
-            {stop, Error, State}
+            {stop, {shutdown, Error}, State}
     end.
 
 connect_int(Address, Port, Options, State) ->

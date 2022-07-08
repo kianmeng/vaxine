@@ -1,9 +1,8 @@
 -module(vx_wal_stream).
--behaviour(poolboy_worker).
 -behaviour(gen_statem).
 
 -export([ start_link/1,
-          start_replication/2,
+          start_replication/3,
           stop_replication/1,
           notify_commit/2
         ]).
@@ -54,7 +53,7 @@
                %% Retry backoff for tcp port send
                port_retry_tref :: reference() | undefined,
                port_retry_backoff :: backoff:backoff(),
-               port :: port()
+               port :: port() | undefined
               }).
 
 -record(commit, { partition :: antidote:partition_id(),
@@ -66,21 +65,14 @@ start_link(Args) ->
     gen_statem:start_link(?MODULE, Args, []).
 
 %% @doc
--spec start_replication(port(), list()) ->
-
+-spec start_replication(pid(), port(), list()) ->
           {ok, pid()} | {error, term()}.
-start_replication(Port, _DiskLogPos) ->
-    case poolboy:checkout(?MODULE, false) of
-        full ->
-            {error, pool_is_full};
-        Pid ->
-            gen_statem:call(Pid, {start_replication, Port}, infinity)
-    end.
+start_replication(Pid, Port, _DiskLogPos) ->
+    gen_statem:call(Pid, {start_replication, Port}, infinity).
 
 -spec stop_replication(pid()) -> ok | {error, term()}.
 stop_replication(Pid) ->
-    catch gen_statem:call(Pid, {stop_replication}),
-    poolboy:checkin(?MODULE, Pid).
+    gen_statem:call(Pid, {stop_replication}).
 
 %% @doc Callback for logging_vnode to notify us about new transactions
 -spec notify_commit(term(), pid()) -> ok.
@@ -147,11 +139,13 @@ init(_Args) ->
                                     self(), port_send_retry),
     PortSendBackoff1 = backoff:type(PortSendBackoff0, jitter),
 
+    ok = vx_wal_stream_server:register(),
     {ok, init_stream, #data{file_name = LogFile,
                             txns_buffer = dict:new(),
                             partition = Partition,
                             file_poll_backoff = FilePollBackoff1,
-                            port_retry_backoff = PortSendBackoff1
+                            port_retry_backoff = PortSendBackoff1,
+                            file_status = more_data
                            }}.
 
 %% Copied from logging_vnode and simplified for our case
@@ -227,24 +221,26 @@ await_data(info, {gen_event_EXIT, _Handler, _Reason}, Data) ->
     %% FIXME: probably safer just to restart the process
     ok = logging_notification_server:add_handler(
            ?MODULE, notify_commit, [self()]),
-    {keep_state, Data};
+    keep_state_and_data;
 
-await_data(_, Msg, Data) ->
+await_data(info, {inet_reply, _Sock, ok}, _Data) ->
+    keep_state_and_data;
+
+await_data(info, {inet_reply, _Sock, {error, Reason}}, Data) ->
+    logger:error("socket error: ~p~n", [Reason]),
+    {stop, {shutdown, Reason}, Data};
+
+await_data(_, Msg, _Data) ->
     %% FIXME: handle {stop_replication} message here
-    logger:info("Ignored message: ~p~n", [Msg]),
-    {keep_state, Data}.
+    logger:info("Ignored message wal streamer: ~p~n", [Msg]),
+    keep_state_and_data.
 
 %%------------------------------------------------------------------------------
 
 continue_send(#data{} = Data) ->
     case notify_client(Data#data.to_send, Data) of
-        {ok, Data1} ->
-            case Data1#data.last_read_txid == Data1#data.last_notif_txid of
-                true ->
-                    {keep_state, Data1};
-                false ->
-                    {next_state, await_data, set_file_poll_timer(Data1)}
-            end;
+        {ok, Data1} when Data1#data.file_status == more_data ->
+            continue_wal_reading(Data1);
         {retry, Data1} ->
             {keep_state, Data1};
         {error, _Reason} = Error ->
@@ -257,47 +253,26 @@ continue_wal_reading(#data{partition = Partition} = Data) ->
                 [Data#data.client, Data#data.partition, Data#data.file_pos]),
 
     case read_ops_from_log(Data) of
-        {ok, N, Data1} ->
-            {_, Backoff} =
-                case N of
-                    0 -> backoff:fail(Data#data.file_poll_backoff);
-                    N when N > 0 -> backoff:succeed(Data#data.file_poll_backoff)
-                end,
-            Data2 = Data1#data{file_poll_backoff = Backoff},
-
+        {ok, Data1} when Data1#data.file_status == more_data ->
+            {next_state, await_data, Data1};
+        {ok, Data1} when Data1#data.file_status == eof ->
             ok = mark_as_ready_for_notification(Partition),
             case fetch_latest_position(Partition) of
                 undefined ->
-                    {next_state, await_data, Data2};
-                {TxId, _, _} when TxId == Data2#data.last_read_txid ->
+                    {next_state, await_data, Data1};
+                {TxId, _, _} when TxId == Data1#data.last_read_txid ->
                     %% All the data is read, no need to set the timer
-                    {next_state, await_data, Data2#data{last_notif_txid = TxId}};
-                {TxId, _, _} when TxId == Data2#data.last_notif_txid ->
+                    {next_state, await_data, Data1#data{last_notif_txid = TxId}};
+                {TxId, _, _} when TxId == Data1#data.last_notif_txid ->
                     %% No matter whether or not we read something new,
                     %% we didn't read TxId transaction, so set the poll timer
                     %% based on backoff value
-                    case Data2#data.to_send =:= [] of
-                        true ->
-                            {next_state, await_data, set_file_poll_timer(Data2)};
-                        false ->
-                            %% We know that the timer is set for sending to the socket
-                            %% no need to set timer here
-                            {next_state, await_data,
-                             Data2#data{last_notif_txid = TxId}}
-                    end;
+                    {next_state, await_data, set_file_poll_timer(Data1)};
                 {TxId, _, _} ->
-                    case Data2#data.to_send =:= [] of
-                        true ->
-                            %% New TxId since we last checked. For now I would like
-                            %% to keep it as a separate case here.
-                            {next_state, await_data,
-                             set_file_poll_timer(Data2#data{last_notif_txid = TxId})};
-                        false ->
-                            %% We know that the timer is set for sending to the socket
-                            %% no need to set timer here
-                            {next_state, await_data,
-                             Data2#data{last_notif_txid = TxId}}
-                    end
+                    %% New TxId since we last checked. For now I would like
+                    %% to keep it as a separate case here.
+                    {next_state, await_data,
+                     set_file_poll_timer(Data1#data{last_notif_txid = TxId})}
             end;
         {error, _} = Error ->
             {stop, Error}
@@ -337,7 +312,16 @@ open_log(LogFile) ->
     {ok, FD}.
 
 read_ops_from_log(Data) ->
-    read_ops_from_log(Data, 0).
+    case read_ops_from_log(Data, 0) of
+        {ok, 0, Data1} ->
+            {_, Backoff} = backoff:fail(Data1#data.file_poll_backoff),
+            {ok, Data1#data{file_poll_backoff = Backoff}};
+        {ok, _, Data1} ->
+            {_, Backoff} = backoff:succeed(Data1#data.file_poll_backoff),
+            {ok, Data1#data{file_poll_backoff = Backoff}};
+        {error, _} = Error ->
+            Error
+    end.
 
 read_ops_from_log(#data{txns_buffer = TxnBuff,
                         file_pos = FPos,
@@ -347,23 +331,14 @@ read_ops_from_log(#data{txns_buffer = TxnBuff,
     case read_ops_from_log(Fd, Data#data.file_name, FPos, FBuff, TxnBuff) of
         %% IF we received eof here, that means we haven't read anything from the
         %% log during this call
-        {eof, LogPosition, {NonComittedMap, ComittedData}} ->
+        {eof, LogPosition, {NonComittedMap, []}} ->
             %% FIXME: What is the position here?
             {FPos1, FBuff1} = LogPosition,
-            case
-                notify_client(ComittedData, Data#data{txns_buffer = NonComittedMap,
-                                                      file_pos = FPos1,
-                                                      file_buff = FBuff1,
-                                                      file_status = eof
-                                                     })
-            of
-                {ok, Data1} ->
-                    {ok, N, Data1};
-                {retry_send, Data1} ->
-                    {ok, N, Data1};
-                {error, _} = Error ->
-                    Error
-            end;
+            {ok, N, Data#data{txns_buffer = NonComittedMap,
+                              file_pos = FPos1,
+                              file_buff = FBuff1,
+                              file_status = eof
+                             }};
         {error, _} = Error ->
             Error;
         {ok, LogPosition, {NonComittedMap, ComittedData}} ->
@@ -377,7 +352,7 @@ read_ops_from_log(#data{txns_buffer = TxnBuff,
             of
                 {ok, Data1} ->
                     read_ops_from_log(Data1, N+1);
-                {retry_send, Data1} ->
+                {retry, Data1} ->
                     {ok, N + 1, Data1};
                 {error, _} = Error ->
                     Error
@@ -488,13 +463,13 @@ preprocess_comitted(L) ->
 
 notify_client([], Data) ->
     {ok, Data};
-notify_client(FinalyzedTxns, #data{client = ClientPid} = Data) ->
-    case notify_client0(FinalyzedTxns, undefined, ClientPid) of
+notify_client(FinalyzedTxns, #data{port = Port} = Data) ->
+    case notify_client0(FinalyzedTxns, undefined, Port) of
         {ok, LastTxId} ->
             {ok, Data#data{last_read_txid = LastTxId,
                            to_send = []
                           }};
-        {retry_send, NotSendTxns} ->
+        {retry, NotSendTxns} ->
             {retry, set_port_send_timer(Data#data{to_send = NotSendTxns})};
         {error, Reason} ->
             {error, Reason}

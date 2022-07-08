@@ -36,7 +36,7 @@ init(_) ->
                  workers = []
                } }.
 
-handle_call({register}, {_, Pid}, State) ->
+handle_call({register}, {Pid, _}, State) ->
     case lists:keyfind(Pid, 2, State#state.workers) of
         false ->
             MonRef = erlang:monitor(process, Pid),
@@ -48,7 +48,7 @@ handle_call({register}, {_, Pid}, State) ->
     end;
 
 handle_call(_Info, _From, State) ->
-    {reply, error, State}.
+    {reply, {error, not_implemented}, State}.
 
 handle_cast(_, State) ->
     {noreply, State}.

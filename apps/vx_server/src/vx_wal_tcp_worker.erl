@@ -22,6 +22,7 @@ start_link(Ref, Transport, ProtoOpts) ->
     Pid = proc_lib:spawn_link(?MODULE, init, [{Ref, Transport, ProtoOpts}]),
     {ok, Pid}.
 
+-spec send(port(), term()) -> boolean() | {error, term()}.
 send(Port, Data) ->
     Binary = term_to_binary(Data),
     try
@@ -29,7 +30,6 @@ send(Port, Data) ->
     catch _:_ ->
             {error, port_closed}
     end.
-
 
 init({Ref, Transport, _Opts}) ->
     {ok, Socket} = ranch:handshake(Ref),
@@ -49,10 +49,17 @@ handle_cast(_, State) ->
 handle_info({tcp, Socket, Data}, #state{transport = Transport} = State) ->
     try
         ok = Transport:setopts(Socket, [{active, once}]),
-        handle_vx_wal_protocol(binary_to_term(Data), State)
+        handle_vx_wal_protocol(Data, State)
     of
         {ok, Req} ->
-            handle_request(Req, State);
+            case handle_request(Req, State) of
+                {reply, Req1, State1} ->
+                    ok = Transport:send(Socket, term_to_binary(Req1)),
+                    {noreply, State1};
+                {error, Error} ->
+                    ok = Transport:send(Socket, mk_error(Error)),
+                    {stop, {shutdown, Error}, State}
+            end;
         {error, Error} ->
             ok = Transport:send(Socket, mk_error(Error)),
             {noreply, State}
@@ -61,38 +68,43 @@ handle_info({tcp, Socket, Data}, #state{transport = Transport} = State) ->
             logger:error("~p: ~p~n~p~n When handling request ~p~n",
                          [Type, Error, Stack, Data]),
             ok = Transport:send(Socket, mk_error(bad_proto)),
-            {stop, {error, bad_proto}}
+            {stop, {error, bad_proto}, State}
     end;
 handle_info({tcp_error, _, Reason}, #state{socket = Socket,
                                            transport = Transport,
                                            wal_stream = Pid
-                                          }) ->
+                                          } = State) ->
     logger:error("Socket error: ~p", [Reason]),
     Transport:close(Socket),
     ok = vx_wal_stream:stop_replication(Pid),
-    {stop, {error, Reason}};
-handle_info({tcp_closed, _}, #state{}) ->
-    {stop, normal}.
+    {stop, {error, Reason}, State};
+handle_info({tcp_closed, _}, State) ->
+    {stop, normal, State};
+
+handle_info({'EXIT', _, process, Pid, Reason}, #state{wal_stream = Pid} = State) ->
+    case Reason of
+        normal ->
+            {noreply, State#state{wal_stream = undefined}};
+        _ ->
+            {stop, {error, {wal_stream_crashed, Reason}}, State}
+    end;
+handle_info(Msg, State) ->
+    logger:info("Ignored message tcp_worker: ~p~n", [Msg]),
+    {noreply, State}.
 
 terminate(_, _) ->
     ok.
 
 %%------------------------------------------------------------------------------
 
-handle_vx_wal_protocol(Req, _State) ->
-    Req.
+handle_vx_wal_protocol(BinaryReq, _State) ->
+    {ok, binary_to_term(BinaryReq)}.
 
 handle_request({start_replication, _Opts}, State) ->
-    case vx_wal_stream:start_replication([]) of
-        {ok, Pid} ->
+    {ok, Pid} = vx_wal_stream:start_link([]),
+    case vx_wal_stream:start_replication(Pid, State#state.socket, []) of
+        {ok, _} ->
             {reply, ok, State#state{wal_stream = Pid}};
-        {error, Reason} ->
-            {reply, mk_error(Reason), State}
-    end;
-handle_request({ack_replication}, #state{wal_stream = Pid} = State) ->
-    case vx_wal_stream:ack_replication(Pid) of
-        ok ->
-            {reply, ok, State};
         {error, Reason} ->
             {reply, mk_error(Reason), State}
     end;
@@ -106,6 +118,6 @@ handle_request({stop_replication}, #state{wal_stream = Pid} = State)
     end.
 
 mk_error(bad_proto) ->
-    {error, bad_proto};
+    term_to_binary({error, bad_proto});
 mk_error(_) ->
-    {error, unknown_error}.
+    term_to_binary({error, unknown_error}).

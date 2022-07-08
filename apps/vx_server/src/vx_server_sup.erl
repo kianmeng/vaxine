@@ -26,26 +26,17 @@ init([]) ->
         [ ?CHILD(vx_subs_server, worker, []),
           ?CHILD(vx_proxy_server, worker, []),
           pb_sub_listener(),
-          ?CHILD(vx_wal_stream_server, worker, []),
-          wal_streamer()
+          ?CHILD(vx_wal_stream_server, worker, [])
         ],
     {ok, {SupFlags, ChildSpecs}}.
 
 pb_sub_listener() ->
     ranch:child_spec(
-      {?MODULE, vx_subs_worker}, ranch_tcp,
+      {?MODULE, vx_wal_tcp_worker}, ranch_tcp,
       #{ num_acceptors => vx_server_app:get_pb_pool_size(),
          max_connections => vx_server_app:get_pb_max_connections(),
          socket_opts => [{port, vx_server_app:get_pb_port()}]
        },
-      vx_subs_worker, []
+      vx_wal_tcp_worker, []
      ).
 
-wal_streamer() ->
-    PoolName = vx_wal_stream,
-    PoolArgs = [{name, {local, PoolName}},
-                {worker_module, PoolName},
-                {size, 1},
-                {max_overflow, 50}
-               ],
-    poolboy:child_spec(PoolName, PoolArgs, []).
